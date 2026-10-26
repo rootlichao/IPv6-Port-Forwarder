@@ -1,0 +1,22 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+.venv/
+
+# 打包生成的临时文件
+build/
+dist/
+*.spec
+
+# 编辑器配置
+.vscode/
+.idea/
+
+# 本地运行产生的配置文件（极其重要，包含密码）
+config.json
+last_ipv6_cache
+.ipv6_port_tool/
