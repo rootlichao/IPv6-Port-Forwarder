@@ -6,7 +6,8 @@ from ui_main import MainWindow
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("IPv6PortTool")
+    # 保持中文应用名
+    app.setApplicationName("光猫 IPv6 端口放行工具")
     # 允许关闭窗口后程序继续在托盘运行
     app.setQuitOnLastWindowClosed(False)
 

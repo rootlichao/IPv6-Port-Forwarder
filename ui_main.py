@@ -27,8 +27,8 @@ class UpdateChecker(QThread):
     update_found = Signal(str)
     def run(self):
         try:
-            # TODO: 发布前请替换为你自己的 GitHub 仓库地址
-            req = urllib.request.urlopen("https://api.github.com/repos/yourname/yourrepo/releases/latest", timeout=5)
+            # 已替换为你真实的 GitHub 仓库地址
+            req = urllib.request.urlopen("https://api.github.com/repos/rootlichao/IPv6-Port-Forwarder/releases/latest", timeout=5)
             data = json.loads(req.read().decode())
             latest_version = data.get("tag_name", "")
             if latest_version and latest_version != CURRENT_VERSION:
@@ -143,7 +143,6 @@ class ServiceWorker(QThread):
                 current_logs.append(msg)
 
             recover_msg = ""
-            # 光猫在线状态检测
             if self.cfg.get("check_online"):
                 online = ping_host(self.cfg["router_ip"])
                 step_log(f"{'✅' if online else '❌'} 路由器在线状态: {online}")
@@ -176,7 +175,6 @@ class ServiceWorker(QThread):
                               rows, self.adapter_class, log=step_log)
             self.finished_ok.emit(res["ok"])
 
-            # 邮件通知触发逻辑
             if res["ok"]:
                 if self._just_recovered:
                     self._just_recovered = False
@@ -482,7 +480,6 @@ class MainWindow(QMainWindow):
         self.chk_boot.toggled.connect(self._on_autostart_toggled)
 
     def _sync_interval_to_worker(self, val):
-        """当用户修改巡检间隔时，实时更新后台线程的配置"""
         if self.worker and self.worker.isRunning():
             latest_cfg = self.collect_config()
             self.worker.request_refresh(latest_cfg)
@@ -577,12 +574,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先点击【停止服务】，然后再执行一键诊断。")
             return
         cfg = self.collect_config()
-        if not cfg["router_ip"] or not cfg["username"]: return
+        # 【修复】如果没填 IP 或 密码，直接拦截弹窗
+        if not cfg["router_ip"] or not cfg["username"] or not cfg["password"]: 
+            QMessageBox.warning(self, "提示", "请先填写完整的 IP、用户名和密码！")
+            return
         self.log("\n" + "="*50)
         diagnose_router(cfg["router_ip"], cfg["username"], cfg["password"], log=self.log)
         self.log("="*50 + "\n")
 
     def reboot_router(self):
+        cfg = self.collect_config()
+        # 【修复】如果没填密码，直接拦截
+        if not cfg["router_ip"] or not cfg["username"] or not cfg["password"]: 
+            QMessageBox.warning(self, "提示", "请先填写完整的 IP、用户名和密码！")
+            return
+
         reply = QMessageBox.warning(
             self, "⚠️ 重启确认", 
             "确定要重启光猫吗？\n\n"
@@ -596,11 +602,11 @@ class MainWindow(QMainWindow):
             self.log("🛑 检测到服务正在运行，准备先行停止...")
             self.stop_service()
             
-        cfg = self.collect_config()
-        if not cfg["router_ip"] or not cfg["username"]: return
-        
+        # 【修复】根据底层返回的真实结果来提示
         if reboot_router(cfg["router_ip"], cfg["username"], cfg["password"], log=self.log):
-            self.log("⏳ 光猫正在重启，请等待 1-2 分钟后重新点击【启动服务】。")
+            QMessageBox.information(self, "成功", "重启指令已成功下发！")
+        else:
+            QMessageBox.critical(self, "失败", "重启指令下发失败，请查看运行日志。")
 
     def force_quit(self):
         self._force_quit = True
@@ -661,6 +667,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先填写路由器 IP 和用户名"); return
         if self.cb_plugin.count() == 0:
             QMessageBox.warning(self, "提示", "未找到任何光猫适配插件"); return
+
+        # 【新增】UI 层面拦截：检查是否填了至少一个端口
+        has_port = False
+        for row in cfg["rows"]:
+            if (row.get("port4") or "").strip() or (row.get("port6") or "").strip():
+                has_port = True
+                break
+        if not has_port:
+            QMessageBox.warning(self, "提示", "请先在下方表格中填写至少一个【端口号】！")
+            return
             
         self.cfg = cfg; save_config(cfg); self.log("💾 配置已保存")
         self.worker = ServiceWorker(cfg, self.cb_plugin.currentData())

@@ -7,11 +7,10 @@ import sys
 import time
 import datetime
 import os
-import importlib
+import types
 from typing import List, Dict, Tuple
 
 from config import load_cached_ipv6, save_cached_ipv6
-from plugins.base import BaseAdapter
 
 # 跨平台隐藏子进程黑框
 if sys.platform.startswith("win"):
@@ -19,21 +18,54 @@ if sys.platform.startswith("win"):
 else:
     CREATE_NO_WINDOW = 0
 
-# ---------- 插件加载器 ----------
+# ---------- 插件加载器（物理文件读取版） ----------
 def load_plugins() -> List[type]:
     """动态扫描并加载 plugins 目录下的所有光猫适配插件"""
     adapters = []
-    plugin_dir = os.path.join(os.path.dirname(__file__), "plugins")
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    plugin_dir = os.path.join(base_dir, "plugins")
+    
     if not os.path.exists(plugin_dir):
+        print(f"未找到插件目录: {plugin_dir}")
         return adapters
-        
+
+    base_file = os.path.join(plugin_dir, "base.py")
+    BaseAdapter = None
+    if os.path.exists(base_file):
+        try:
+            with open(base_file, "r", encoding="utf-8") as f:
+                code = f.read()
+            ns = {"__name__": "plugins.base", "__file__": base_file}
+            exec(compile(code, base_file, "exec"), ns)
+            BaseAdapter = ns.get("BaseAdapter")
+        except Exception as e:
+            print(f"加载 base.py 失败: {e}")
+            return adapters
+
+    if not BaseAdapter:
+        return adapters
+
+    fake_pkg = types.ModuleType("plugins")
+    fake_base = types.ModuleType("plugins.base")
+    fake_base.BaseAdapter = BaseAdapter
+    fake_pkg.base = fake_base
+    sys.modules["plugins"] = fake_pkg
+    sys.modules["plugins.base"] = fake_base
+
     for file in os.listdir(plugin_dir):
         if file.endswith(".py") and file not in ("__init__.py", "base.py"):
-            module_name = f"plugins.{file[:-3]}"
+            file_path = os.path.join(plugin_dir, file)
             try:
-                module = importlib.import_module(module_name)
-                for attr in dir(module):
-                    obj = getattr(module, attr)
+                with open(file_path, "r", encoding="utf-8") as f:
+                    code = f.read()
+                ns = {"__name__": f"plugins.{file[:-3]}", "__file__": file_path}
+                exec(compile(code, file_path, "exec"), ns)
+                for attr_name in ns:
+                    if attr_name.startswith("__"): continue
+                    obj = ns[attr_name]
                     if isinstance(obj, type) and issubclass(obj, BaseAdapter) and obj != BaseAdapter:
                         adapters.append(obj)
             except Exception as e:
@@ -42,7 +74,6 @@ def load_plugins() -> List[type]:
 
 # ---------- 本机网络信息获取 ----------
 def get_all_ips() -> Tuple[Dict[str, str], str]:
-    """跨平台获取本机的公网/局域网 IPv4 及 IPv6 地址"""
     ips = {"p4": "", "t4": "", "p6": "", "t6": ""}
     main_dev = "未知网卡"
     try:
@@ -87,7 +118,6 @@ def get_all_ips() -> Tuple[Dict[str, str], str]:
     return ips, main_dev
 
 def ping_host(host: str, timeout: int = 2) -> bool:
-    """跨平台 Ping 检测"""
     if sys.platform.startswith("win"):
         cmd = ["ping", "-n", "1", "-w", str(timeout * 1000), host]
     else:
@@ -99,17 +129,15 @@ def ping_host(host: str, timeout: int = 2) -> bool:
 
 # ---------- 纯 Python Telnet 客户端 ----------
 class RouterTelnet:
-    """完全基于 Socket 实现的 Telnet，跨平台且无外部依赖"""
     IAC, DONT, DO, WONT, WILL, SB, SE = 0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF0
     
-    def __init__(self, ip, user, password, timeout=15, port=23):
+    def __init__(self, ip, user, password, timeout=5, port=23):
         self.ip, self.user, self.password = ip, user, password
         self.timeout, self.port = timeout, port
         self.sock, self._buf = None, ""
         
     def __enter__(self):
         self.connect(); return self
-        
     def __exit__(self, exc_type, exc, tb):
         self.close()
         
@@ -149,12 +177,18 @@ class RouterTelnet:
         self.sock.sendall((line + "\r\n").encode("utf-8"))
         
     def connect(self):
+        if not self.password:
+            raise RuntimeError("Telnet 密码为空，请检查输入！")
+            
         self.sock = socket.create_connection((self.ip, self.port), timeout=self.timeout)
         self._recv_until("login:")
         self._send_line(self.user)
         self._recv_until("Password:")
         self._send_line(self.password)
-        self._recv_until("#")
+        
+        res = self._recv_until("#", timeout=self.timeout)
+        if "#" not in res:
+            raise RuntimeError("登录超时，密码错误或光猫未响应！")
         
     def run(self, cmd: str) -> str:
         self._send_line(cmd)
@@ -170,18 +204,22 @@ class RouterTelnet:
 
 # ---------- 核心应用与清理流程 ----------
 def apply_rules(router_ip: str, user: str, password: str, rows: List[dict], adapter_class: type, log=print) -> dict:
-    """下发端口转发规则，并返回执行状态"""
     start_time = datetime.datetime.now()
     log(f"⏱️ [开始执行] 时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # 防呆拦截：密码为空
     if not password:
         log("❌ 错误：Telnet 密码不能为空，请在上方输入光猫密码！")
         return {"ok": False, "changed_p6": False, "changed_t6": False, "old_p6": "", "old_t6": "", "new_p6": "", "new_t6": ""}
         
-    # 防呆拦截：表格为空
-    if not rows:
-        log("❌ 错误：端口表格为空，请至少输入一个需要放行的端口号！")
+    # 【核心修复】检查是否真的填了端口，防止空表格假成功
+    has_port = False
+    for r in rows:
+        if (r.get("port4") or "").strip() or (r.get("port6") or "").strip():
+            has_port = True
+            break
+            
+    if not has_port:
+        log("❌ 错误：表格中未填写任何端口号，已取消执行！")
         return {"ok": False, "changed_p6": False, "changed_t6": False, "old_p6": "", "old_t6": "", "new_p6": "", "new_t6": ""}
 
     ips, main_dev = get_all_ips()
@@ -197,7 +235,6 @@ def apply_rules(router_ip: str, user: str, password: str, rows: List[dict], adap
     log(f"✅ 当前临时 IPv6: {ips['t6'] or '无'}")
     log(f"🔌 正在使用插件: {adapter_class.NAME}")
 
-    # 对比缓存，判断 IP 是否发生变化
     cached = load_cached_ipv6()
     old_p6 = cached.get("p6", ""); old_t6 = cached.get("t6", "")
     if old_p6 != ips["p6"] or old_t6 != ips["t6"]:
@@ -211,21 +248,19 @@ def apply_rules(router_ip: str, user: str, password: str, rows: List[dict], adap
 
     add_cmds = adapter_class.build_rules(rows, ips)
     if not add_cmds:
-        log("⚠️ 插件未生成任何规则，跳过 telnet 操作")
+        log("⚠️ 插件未生成任何规则（端口可能不合法）")
         end_time = datetime.datetime.now(); duration = (end_time - start_time).total_seconds()
         log(f"⏱️ [结束执行] 时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')} (耗时 {duration:.2f} 秒)")
-        result["ok"] = True
+        result["ok"] = False  # 改为 False 避免假成功
         return result
 
     try:
         with RouterTelnet(router_ip, user, password, port=23) as rt:
             log("🔌 telnet 登录中...")
             
-            # 先清空旧规则
             for c in adapter_class.purge_rules(rows):
                 rt.run(c)
                 
-            # 再下发新规则
             for c in add_cmds:
                 rt.run(c)
 
@@ -234,7 +269,6 @@ def apply_rules(router_ip: str, user: str, password: str, rows: List[dict], adap
             
             status_cmds = adapter_class.get_status_cmds()
             
-            # 验尸：检查 IPv6 FORWARD 链
             out6_f = rt.run(status_cmds["ipv6_forward"])
             log("--- IPv6 FORWARD 链 ---"); log(out6_f.strip())
             
@@ -244,7 +278,6 @@ def apply_rules(router_ip: str, user: str, password: str, rows: List[dict], adap
                 result["ok"] = False
                 return result
 
-            # 打印其余状态用于调试
             out6_n = rt.run(status_cmds["ipv6_nat"])
             log("--- IPv6 NAT PREROUTING 链 ---"); log(out6_n.strip())
             
@@ -268,14 +301,17 @@ def apply_rules(router_ip: str, user: str, password: str, rows: List[dict], adap
         return result
 
 def clear_rules(router_ip: str, user: str, password: str, rows: List[dict], adapter_class: type, log=print) -> bool:
-    """清理光猫中的旧规则"""
-    # 防呆拦截：密码为空
     if not password:
         log("❌ 错误：Telnet 密码不能为空，无法执行清理！")
         return False
         
-    # 防呆拦截：表格为空
-    if not rows:
+    has_port = False
+    for r in rows:
+        if (r.get("port4") or "").strip() or (r.get("port6") or "").strip():
+            has_port = True
+            break
+            
+    if not has_port:
         log("❌ 错误：端口表格为空，没有需要清理的规则！")
         return False
 
@@ -299,10 +335,12 @@ def clear_rules(router_ip: str, user: str, password: str, rows: List[dict], adap
 
 # ---------- 高级控制台功能 ----------
 def diagnose_router(router_ip: str, user: str, password: str, log=print) -> str:
-    """一键提取光猫底层环境信息"""
+    if not password:
+        log("❌ 错误：Telnet 密码不能为空，无法提取环境！")
+        return ""
+
     log("🔍 开始提取光猫环境信息...")
     info = "========= 光猫环境诊断报告 =========\n"
-    
     try:
         with RouterTelnet(router_ip, user, password, port=23) as rt:
             cmds = [
@@ -313,13 +351,11 @@ def diagnose_router(router_ip: str, user: str, password: str, log=print) -> str:
                 ("nft所有表", "nft list tables"),
                 ("ip6tables规则", "ip6tables -L -n | head -10"),
             ]
-            
             for name, cmd in cmds:
                 info += f"\n[{name}] 执行: {cmd}\n"
                 rt._send_line(cmd)
                 time.sleep(0.5) 
                 out = rt._recv_until("#")
-                
                 lines = out.splitlines()
                 clean_lines = []
                 for line in lines:
@@ -327,67 +363,63 @@ def diagnose_router(router_ip: str, user: str, password: str, log=print) -> str:
                     if not line_str or line_str == cmd or line_str.endswith("#") or line_str.endswith("$"):
                         continue
                     clean_lines.append(line_str)
-                
                 result_str = "\n".join(clean_lines).strip()
                 info += result_str if result_str else "  (无返回或命令不存在)\n"
                 info += "-" * 30 + "\n"
-                
         log("✅ 诊断信息提取完毕，请查看下方输出。")
     except Exception as e:
         info += f"\n❌ 提取失败: {e}\n"
         log(f"❌ 提取失败: {e}")
-        
     log(info)
     return info
 
 def reboot_router(router_ip: str, user: str, password: str, log=print) -> bool:
-    """向光猫发送重启命令"""
+    if not password:
+        log("❌ 错误：Telnet 密码不能为空，无法重启光猫！")
+        return False
+
     log("🔄 正在连接光猫下发重启指令...")
     try:
         with RouterTelnet(router_ip, user, password, port=23) as rt:
             rt._send_line("reboot")
-            time.sleep(1)
-            log("✅ 重启指令已下发，请等待光猫重启并自动重连。")
+            time.sleep(2)
+            log("✅ 重启指令已成功下发，光猫正在断开连接，请稍后手动启动服务。")
             return True
     except Exception as e:
+        if "接收失败" in str(e) or "reset by peer" in str(e).lower():
+            log("✅ 重启指令已下发，连接已被光猫断开（正常现象）。")
+            return True
         log(f"❌ 重启失败: {e}")
         return False
 
 def exec_custom_script(router_ip: str, user: str, password: str, script_text: str, log=print) -> bool:
-    """连接光猫并执行用户输入的自定义命令"""
+    if not password:
+        log("❌ 错误：Telnet 密码不能为空，无法执行脚本！")
+        return False
     if not script_text.strip():
         log("⚠️ 自定义脚本为空，跳过执行。")
         return False
-
     log("🚀 开始执行自定义脚本...")
     lines = [line.strip() for line in script_text.splitlines() if line.strip()]
-    
     try:
         with RouterTelnet(router_ip, user, password, port=23) as rt:
             log("🔌 telnet 登录成功，开始下发命令...")
-            
             for cmd in lines:
                 if cmd.startswith("#"): continue
-                
                 log(f"➜ 执行: {cmd}")
                 rt._send_line(cmd)
                 time.sleep(0.5)
                 out = rt._recv_until("#")
-                
                 clean_lines = []
                 for line in out.splitlines():
                     line_str = line.strip()
                     if not line_str or line_str == cmd or line_str.endswith("#"): 
                         continue
                     clean_lines.append(line_str)
-                
                 result_str = "\n".join(clean_lines).strip()
-                if result_str:
-                    log(result_str)
-                else:
-                    log("  (无返回输出)")
+                if result_str: log(result_str)
+                else: log("  (无返回输出)")
                 log("-" * 30)
-
         log("✅ 自定义脚本执行完毕")
         return True
     except Exception as e:
